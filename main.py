@@ -1,8 +1,3 @@
-from fastapi import FastAPI
+from dq_monitor.api import app
 
-app = FastAPI()
-
-
-@app.get("/")
-def read_root():
-    return {"Hello": "World"}
+__all__ = ["app"]
