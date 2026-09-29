@@ -1,18 +1,22 @@
-"""服务门面：组合规则登记、批次登记、执行与查询。"""
+"""服务门面：组合规则登记、批次登记、执行、影响试算与历史回溯查询。"""
 from __future__ import annotations
 
 from typing import Any
 
-from dqm import executor, rules
-from dqm.errors import BatchNotFound, DQError
+from dqm import backfill, executor, rules, trial
+from dqm.errors import BackfillError, BatchNotFound
 from dqm.models import (
+    BackfillJob,
     Batch,
     BatchReport,
     BatchStatus,
+    Revision,
+    RevisionComparison,
     RuleSpec,
     RuleType,
     RuleVersion,
     Severity,
+    TrialResult,
 )
 from dqm.storage import Storage
 
@@ -78,6 +82,7 @@ class DQService:
             return BatchReport(batch_id, batch.status, None, {}, (), ())
         failures = tuple(f for f in execution.findings if f.severity is Severity.FAILURE)
         warnings = tuple(f for f in execution.findings if f.severity is Severity.WARNING)
+        latest = self._storage.latest_revision(batch_id)
         return BatchReport(
             batch_id=batch_id,
             status=batch.status,
@@ -85,6 +90,7 @@ class DQService:
             rule_versions=dict(execution.rule_versions),
             failures=failures,
             warnings=warnings,
+            revision_no=latest.revision_no if latest else None,
         )
 
     def batch_status(self, batch_id: str) -> BatchStatus:
@@ -92,3 +98,45 @@ class DQService:
         if batch is None:
             raise BatchNotFound(f"批次 {batch_id!r} 不存在")
         return batch.status
+
+    # ---- 规则升级影响试算（纯只读）----
+    def trial_rule(self, payload: dict[str, Any]) -> TrialResult:
+        """对一条待定规则定义做只读影响试算，绝不改动生效规则或历史结论。"""
+        return trial.run_trial(self._storage, _parse_spec(payload))
+
+    # ---- 历史批次回溯 ----
+    def backfill_batches(self, batch_ids: list[str],
+                         max_workers: int | None = None) -> BackfillJob:
+        """把一批历史批次整体按当前生效规则回溯重跑（失败隔离、可重试）。"""
+        return backfill.backfill_batches(self._storage, list(batch_ids),
+                                         max_workers=max_workers)
+
+    def backfill_one(self, batch_id: str) -> RevisionComparison:
+        """单独回溯一个批次并返回新旧结论对照。"""
+        batch = self._storage.get_batch(batch_id)
+        if batch is None:
+            raise BatchNotFound(f"批次 {batch_id!r} 不存在")
+        _, reran = backfill.backfill_batch(self._storage, batch)
+        return backfill.compare_latest(self._storage, batch_id, reran=reran)
+
+    def retry_backfill_job(self, job_id: str) -> BackfillJob:
+        """重试回溯作业中所有未成功的批次。"""
+        return backfill.retry_backfill_job(self._storage, job_id)
+
+    def get_backfill_job(self, job_id: str) -> BackfillJob:
+        job = self._storage.get_backfill_job(job_id)
+        if job is None:
+            raise BackfillError(f"回溯作业 {job_id!r} 不存在")
+        return job
+
+    def compare_revisions(self, batch_id: str) -> RevisionComparison:
+        """并排对照批次最新两个结论版本（旧结论永不覆盖）。"""
+        if self._storage.get_batch(batch_id) is None:
+            raise BatchNotFound(f"批次 {batch_id!r} 不存在")
+        return backfill.compare_latest(self._storage, batch_id)
+
+    def list_revisions(self, batch_id: str) -> list[Revision]:
+        """列出批次全部历史结论版本（含正常执行与回溯产生的版本）。"""
+        if self._storage.get_batch(batch_id) is None:
+            raise BatchNotFound(f"批次 {batch_id!r} 不存在")
+        return self._storage.revisions(batch_id)

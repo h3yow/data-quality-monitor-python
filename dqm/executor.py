@@ -19,9 +19,20 @@ from collections.abc import Callable
 from dqm.models import Batch, BatchStatus, Execution, Finding, RuleVersion, Severity
 from dqm.storage import Storage
 
+# 单批次处理上界：行数过大时明确拒绝（由上层转译为 WorkloadTooLarge），
+# 避免单个超大批次把求值变成无界操作；该上界内结论与逐行处理完全一致。
+MAX_ROWS_PER_BATCH = 100_000
+
+
+class BatchTooLarge(Exception):
+    """单个批次行数超过处理上界。"""
+
 
 def evaluate(rows: list[dict], rules: list[RuleVersion]) -> list[Finding]:
     """纯函数：用给定规则版本对数据求值，返回全部发现（确定性顺序）。"""
+    if len(rows) > MAX_ROWS_PER_BATCH:
+        raise BatchTooLarge(
+            f"批次行数 {len(rows)} 超过单批上界 {MAX_ROWS_PER_BATCH}")
     findings: list[Finding] = []
     for rule_version in rules:
         spec = rule_version.spec
@@ -82,6 +93,10 @@ def _final_status(findings: list[Finding]) -> BatchStatus:
             else BatchStatus.SUCCEEDED)
 
 
+# 公开别名：试算/回溯等模块复用同一份"是否失败"判定，保证结论口径一致
+final_status = _final_status
+
+
 def run_batch(storage: Storage, batch: Batch,
               interrupt: Callable[[], None] | None = None) -> Execution:
     """执行批次校验，返回生效的 Execution（可能是本调用或并发调用产生的）。"""
@@ -94,13 +109,25 @@ def run_batch(storage: Storage, batch: Batch,
     )
     acquired, effective_id = storage.try_begin_execution(execution)
     if not acquired:
-        # 并发/重复提交：去重，等待生效执行完成并返回同一份结果
+        # 并发/重复提交：去重，等待生效执行完成并返回同一份结果。
+        # 若正好有历史回溯在跑，等它完成，返回回溯产生的最新结论——
+        # 正常触发与回溯撞车时，两边拿到的结论对得上。
+        if storage.rerun_owner(batch.batch_id) is not None:
+            from dqm.backfill import wait_for_effective_execution
+
+            return wait_for_effective_execution(storage, batch.batch_id)
         return _wait_committed(storage, batch.batch_id, effective_id)
     try:
         if interrupt is not None:
             interrupt()  # 测试注入的中断点：模拟执行中途崩溃
         findings = evaluate(batch.rows, snapshot)
         storage.commit_execution(execution.execution_id, findings, _final_status(findings))
+    except BatchTooLarge:
+        storage.abort_execution(execution.execution_id)
+        from dqm.errors import WorkloadTooLarge
+        raise WorkloadTooLarge(
+            f"批次 {batch.batch_id!r} 行数 {len(batch.rows)} 超过单批上界 "
+            f"{MAX_ROWS_PER_BATCH}，拒绝执行（不留半完成结果）")
     except BaseException:
         storage.abort_execution(execution.execution_id)
         raise

@@ -117,7 +117,105 @@ class BatchReport:
     rule_versions: dict[str, int]
     failures: tuple[Finding, ...]
     warnings: tuple[Finding, ...]
+    revision_no: int | None = None  # 结论来自哪个修订版本（回溯后产生新版本）
 
     @property
     def counts(self) -> dict[str, int]:
         return {"failures": len(self.failures), "warnings": len(self.warnings)}
+
+
+# ---------------------------------------------------------------------------
+# 规则升级影响试算（只读）
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class BatchImpact:
+    """待定规则对单个历史批次的影响（旧结论 vs 试算结论）。"""
+
+    batch_id: str
+    had_conclusion: bool                 # 该批次此前是否有已生效结论
+    old_status: BatchStatus              # 无结论时为 REGISTERED
+    new_status: BatchStatus
+    flipped: bool                         # 结论是否翻盘（仅对有旧结论的批次有意义）
+    old_rule_versions: dict[str, int]
+    new_rule_versions: dict[str, int]
+    old_counts: dict[str, int]
+    new_counts: dict[str, int]
+    added: tuple[Finding, ...]           # 比旧结论多出的命中
+    removed: tuple[Finding, ...]         # 比旧结论少掉的命中
+
+
+@dataclass(frozen=True)
+class TrialResult:
+    """一次影响试算的完整结果：纯只读派生，重复执行结果一致。"""
+
+    candidate: RuleVersion                # 待定规则的假设版本（不入库、不生效）
+    rule_versions: dict[str, int]         # 试算所用规则快照: rule_id -> version
+    impacts: tuple[BatchImpact, ...]
+    affected_batch_ids: tuple[str, ...]   # 命中集合发生变化的批次
+    flipped_batch_ids: tuple[str, ...]    # 结论翻盘的批次
+    added_by_severity: dict[str, int]     # 新增命中的严重级别分布
+    removed_by_severity: dict[str, int]   # 消失命中的严重级别分布
+
+
+# ---------------------------------------------------------------------------
+# 历史批次回溯（结论版本化，旧结论永不覆盖）
+# ---------------------------------------------------------------------------
+class BackfillItemStatus(str, enum.Enum):
+    """回溯作业中单个批次的状态。"""
+
+    PENDING = "pending"
+    RUNNING = "running"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"       # 中断/异常：可单独重试，不连累其它批次
+
+
+@dataclass(frozen=True)
+class Revision:
+    """批次的一个不可变结论修订版本；回溯追加新版本，旧版本永久保留。"""
+
+    revision_no: int
+    execution_id: str
+    rule_versions: dict[str, int]
+    status: BatchStatus
+    findings: tuple[Finding, ...]
+    source: str             # normal（正常触发）/ backfill（回溯）
+    created_at: float = field(default_factory=_now)
+
+
+@dataclass
+class BackfillItem:
+    """回溯作业中的单个批次条目。"""
+
+    batch_id: str
+    status: BackfillItemStatus = BackfillItemStatus.PENDING
+    error: str | None = None
+    revision_no: int | None = None      # 成功后批次的最新结论版本号
+    reran: bool = False                 # 本次是否真正重跑（False=快照已最新，去重）
+
+
+@dataclass
+class BackfillJob:
+    """一次批量回溯请求的状态账本：逐批次状态清楚、失败可重试。"""
+
+    job_id: str
+    items: dict[str, BackfillItem] = field(default_factory=dict)
+    created_at: float = field(default_factory=_now)
+    finished_at: float | None = None
+
+    def items_by_status(self, status: BackfillItemStatus) -> list[BackfillItem]:
+        return [item for item in self.items.values() if item.status is status]
+
+
+@dataclass(frozen=True)
+class RevisionComparison:
+    """回溯新旧结论并排对照。"""
+
+    batch_id: str
+    previous_revision_no: int | None
+    current_revision_no: int
+    previous_status: BatchStatus | None
+    current_status: BatchStatus
+    flipped: bool
+    reran: bool                         # False 表示当前规则快照与最新结论一致，未真正重跑
+    added: tuple[Finding, ...]
+    removed: tuple[Finding, ...]

@@ -7,11 +7,13 @@
 
 ```
 dqm/
-  models.py    # 规则/批次/执行/发现的类型定义与状态枚举
+  models.py    # 规则/批次/执行/发现/结论修订/试算结果/回溯作业的类型定义与状态枚举
   errors.py    # 领域错误（拒绝原因可区分）
-  storage.py   # 内置存储：单锁临界区，执行权 compare-and-set
+  storage.py   # 内置存储：单锁临界区，执行权/回溯租约 CAS、结论修订账本、只读视图
   rules.py     # 规则登记：定义校验 + 冲突检测
   executor.py  # 纯函数求值 + 幂等执行（并发去重、中断恢复）
+  trial.py     # 规则升级影响试算（纯只读、可重复、全有或全无）
+  backfill.py  # 历史批次回溯（结论版本化、并发唯一生效、失败隔离、中断重试）
   service.py   # 服务门面
 main.py        # FastAPI 薄接口层
 tests/         # pytest 测试（日志打印输入数据与判定依据）
@@ -73,29 +75,178 @@ REGISTERED --(获得执行权)--> RUNNING --(提交结果)--> SUCCEEDED / FAILED
   结论只与快照有关；之后规则变更不影响历史批次，可用快照重新求值复现。
 - **查询稳定**：报告由已提交的不可变执行记录派生，重复查询结果一致。
 
+## 规则升级影响试算（只读，发布前预演）
+
+改规则前，先拿一条**待定规则定义**对着所有已登记历史批次跑一遍预演，
+完全不触碰生效规则与历史结论：
+
+- **纯只读**：试算只持有 `ReadOnlyStorageView`，物理上没有任何写接口可达；
+  不升规则版本、不改批次结论、不新增执行记录。随便重复跑多少次，
+  `TrialResult` 按值完全相等（候选版本时间戳也固定为哨兵值）。
+- **判定口径**：试算快照 = 现行生效规则集 + 待定规则。待定 `rule_id` 与现行
+  规则相同视为"升级候选"（替换现行版本，不与自身旧版本算冲突）；不同则作为
+  "新增规则"叠加。每个批次的旧结论取其最近一次结论修订版本，因此试算结果与
+  确认升级后回溯将产出的新结论严格对得上。
+- **输出内容**：
+  - `flipped_batch_ids`：结论翻盘的批次（succeeded↔failed；从未校验的批次
+    无旧结论，翻盘标记为 false，但其新增命中仍会计入）；
+  - `affected_batch_ids`：命中集合发生任何变化的批次；
+  - 每个批次的 `added` / `removed`：比旧结论多出 / 少掉的具体命中；
+  - `added_by_severity` / `removed_by_severity`：按 failure/warning 的整体分布。
+- **全有或全无**：待定规则非法（`invalid_definition` / `missing_field`）或与
+  现行规则打架（`rule_conflict`）当场拒绝（HTTP 422，`detail.reason` 区分），
+  不静默跳过、不给半截结果；批次数量或单批行数超处理上界返回 413。
+- **确定性**：批次按 `batch_id` 升序、规则按 `rule_id` 升序求值，命中顺序由
+  `evaluate` 固定，与试算发起顺序、并发无关。
+
+```python
+from dqm.service import DQService
+svc = DQService()
+result = svc.trial_rule({"rule_id": "rg", "rule_type": "range", "field": "age",
+                         "params": {"min": 0, "max": 120}})
+print(result.flipped_batch_ids, result.added_by_severity)
+for imp in result.impacts:
+    print(imp.batch_id, imp.old_status, "->", imp.new_status,
+          len(imp.added), len(imp.removed))
+```
+
+## 历史批次回溯（结论版本化，旧结论永不覆盖）
+
+试算确认后，把挑出的一批历史批次整体按**当前生效规则**重跑：
+
+- **结论修订版本（Revision）**：正常校验产生 v1（`source=normal`），
+  每次真正回溯追加 v2/v3（`source=backfill`）。旧版本永久保留，
+  可通过 `list_revisions` / `comparison` 并排追溯，绝不覆盖或抹掉。
+- **新旧对照**：`comparison` 给出上一版与最新版的状态、是否翻盘
+  （`flipped`）、`added` / `removed` 命中；报告 `GET /report` 的
+  `revision_no` 标明当前生效的是第几版。
+- **唯一生效（幂等 + 并发去重）**：回溯租约由存储层在**同一临界区**内完成
+  "是否已最新 + 抢租约"判定（`acquire_rerun_if_stale`），同一批次被重复或
+  并发回溯时只有一次真正执行，输的一方等待并复用同一结果，计数绝不翻倍。
+  目标规则快照若已与最新结论一致，直接去重返回（`reran=false`），不产生新版本。
+- **与正常校验互斥且结论对齐**：回溯进行中正常触发校验会等待其完成并拿到
+  回溯后的最新结论；反过来正常校验占用时回溯也会等待。两者撞车最终结论一致。
+- **失败隔离 + 可单独重试**：批量回溯逐批次记账（`pending/running/
+  succeeded/failed`）。某批次失败或被中断，只把该条目标记 `failed` 并记录
+  错误、释放租约、恢复旧结论状态，不连累同批其它批次、不留半完成结论；
+  可用作业级 `retry` 只重试未成功批次（成功的不重跑），也可对单批次重跑到成功。
+- **有界处理，但结论等价**：单次作业批次上限 10000、并发度上限 8（默认 4）、
+  单批行数上限 100000；超限明确拒绝而非截断。作业内条目按 `batch_id` 排序，
+  最终结论与逐个串行处理完全一致，且与提交顺序无关。
+
+```python
+job = svc.backfill_batches(["b1", "b2"], max_workers=4)   # 批量回溯（作业账本）
+svc.retry_backfill_job(job.job_id)                        # 只重试失败/未完成批次
+cmp_res = svc.backfill_one("b1")                          # 单批回溯并直接拿对照
+svc.list_revisions("b1")                                  # 全部历史结论版本
+```
+
+### 新旧结论兼容范围（规则变更会波及谁）
+
+- **已按旧规则定论的批次**：结论默认保持不变（快照隔离），只有被显式纳入
+  **回溯**的批次才会产生新版本；其旧版本始终可查。
+- **规则变更后新登记/首次校验的批次**：直接适用新规则，不产生历史版本。
+- **试算的影响面**：`affected_batch_ids` 即"若升级并回溯，命中会变"的批次；
+  不在其中的批次（其数据对新旧规则表现一致，或字段与该规则无关）即使回溯，
+  结论与命中也不变，只会因为快照版本不同而追加一版（可据 `comparison` 的
+  `added/removed` 为空识别为"实质无影响"）。
+- **从未校验的登记批次**：纳入试算（旧基线为空），也可直接回溯；其首版结论
+  即按当前规则产生。
+
 ## HTTP 接口
 
 ```
-POST /rules                      登记/变更规则（422 时 detail.reason 区分拒绝原因）
-POST /batches                    登记批次（幂等，返回 created）
-POST /batches/{id}/validate      触发（或去重）校验，返回结论
-GET  /batches/{id}/report        查询结论（稳定一致）
-GET  /batches/{id}/status        查询批次状态
+# 原有
+POST /rules                          登记/变更规则（422 时 detail.reason 区分拒绝原因）
+POST /batches                        登记批次（幂等，返回 created）
+POST /batches/{id}/validate          触发（或去重）校验，返回结论（413=超体量）
+GET  /batches/{id}/report            查询结论（含 revision_no）
+GET  /batches/{id}/status            查询批次状态
+
+# 影响试算（只读）
+POST /trials                         提交待定规则，返回翻盘/新增消失/级别分布
+                                     422=非法或冲突，413=超处理上界
+
+# 历史回溯
+POST /backfills                      批量回溯 {batch_ids, max_workers?}，返回作业账本
+GET  /backfills/{job_id}             查询作业逐批次状态与错误
+POST /backfills/{job_id}/retry       只重试作业中未成功的批次
+POST /batches/{id}/backfill          单独回溯一个批次并直接返回新旧对照
+GET  /batches/{id}/comparison        最新两版结论并排对照
+GET  /batches/{id}/revisions         列出全部历史结论版本（含 source）
 ```
 
 ## 验证方法
 
 ```bash
 uv sync
-uv run pytest -q        # 10 个测试，日志打印输入数据与判定依据
-uv run uvicorn main:app # 启动 HTTP 服务
+uv run pytest -q        # 36 个测试，日志打印输入数据与判定依据
+uv run uvicorn main:app # 启动 HTTP 服务（/docs 可交互试调）
 ```
 
 测试覆盖：
 
 - `tests/test_rules.py`：三类拒绝原因可区分；被拒绝规则不留残渣。
-- `tests/test_execution.py`：重复提交去重（单次生效、计数不重复）；
-  8 线程并发仅一次有效执行且结论一致；中断后状态恢复 `REGISTERED`、
-  无半完成结果、重试成功；并发中一次崩溃仍收敛到唯一生效执行。
-- `tests/test_versioning.py`：规则变更后历史批次结论不变且可按当时
-  快照复现；新批次适用新规则；失败/告警按严重级别分类；重复查询稳定一致。
+- `tests/test_execution.py`：重复提交去重；8 线程并发仅一次有效执行；
+  中断恢复；并发中一次崩溃仍收敛到唯一生效执行。
+- `tests/test_versioning.py`：规则变更后历史批次结论不变且可按快照复现；
+  新批次适用新规则；重复查询稳定一致。
+- `tests/test_trial.py`：翻盘/受影响批次、每批新增消失命中与级别分布；
+  只读（规则版本、历史结论、版本数均不变）；重复试算按值相等且顺序确定；
+  纳入未校验批次；非法/冲突/超量当场拒绝；试算仅持有只读视图（无写方法可达）。
+- `tests/test_backfill.py`：回溯追加修订版本且旧结论保留可复现；新旧对照；
+  快照已最新时去重不重跑；6 线程并发仅一次真正重跑（连跑稳定不闪烁）；
+  中断后恢复旧结论、无半完成结果、可单独重试；批量失败隔离与作业重试；
+  回溯与正常校验撞车结论一致；25 批次乱序 + 8 并发与逐个串行结论完全一致；
+  批次数/单批行数超上界被拒绝。
+- `tests/test_api.py`：试算只读/可重复端点、非法候选 422、回溯全流程与
+  作业重试端点端到端可用。
+
+### 本地手动走一遍（场景核对）
+
+```bash
+uv run uvicorn main:app --reload
+# 另开终端：
+curl -s -X POST localhost:8000/rules -H 'content-type: application/json' \
+  -d '{"rule_id":"rg","rule_type":"range","field":"age","params":{"min":0,"max":200}}'
+curl -s -X POST localhost:8000/batches -H 'content-type: application/json' \
+  -d '{"batch_id":"b1","rows":[{"age":150},{"age":300}]}'
+curl -s -X POST localhost:8000/batches/b1/validate        # 旧规则：1 条 failure
+
+# ① 发布前只读试算：收紧到 [0,120]，看翻盘与新增/消失
+curl -s -X POST localhost:8000/trials -H 'content-type: application/json' \
+  -d '{"rule_id":"rg","rule_type":"range","field":"age","params":{"min":0,"max":120}}'
+# 此时 GET /batches/b1/report 仍是旧结论 v1（试算未改动任何数据）
+
+# ② 正式登记新规则，然后回溯历史批次
+curl -s -X POST localhost:8000/rules -H 'content-type: application/json' \
+  -d '{"rule_id":"rg","rule_type":"range","field":"age","params":{"min":0,"max":120}}'
+curl -s -X POST localhost:8000/backfills -H 'content-type: application/json' \
+  -d '{"batch_ids":["b1"]}'
+
+# ③ 并排对照 + 追溯旧版本
+curl -s localhost:8000/batches/b1/comparison             # v1 -> v2 差异
+curl -s localhost:8000/batches/b1/revisions              # v1(normal)、v2(backfill) 都在
+curl -s localhost:8000/batches/b1/report                 # 当前指向 v2
+```
+
+也可以不启服务，直接用一段 Python 走同一流程：
+
+```bash
+uv run python - <<'PY'
+from dqm.service import DQService
+svc = DQService()
+svc.register_rule({"rule_id": "rg", "rule_type": "range", "field": "age",
+                   "params": {"min": 0, "max": 200}})
+svc.register_batch("b1", [{"age": 150}, {"age": 300}])
+svc.validate_batch("b1")
+trial = svc.trial_rule({"rule_id": "rg", "rule_type": "range", "field": "age",
+                        "params": {"min": 0, "max": 120}})
+print("试算翻盘:", trial.flipped_batch_ids, "新增分布:", trial.added_by_severity)
+svc.register_rule({"rule_id": "rg", "rule_type": "range", "field": "age",
+                   "params": {"min": 0, "max": 120}})
+print("回溯对照:", svc.backfill_one("b1"))
+print("历史版本:", [(r.revision_no, r.source, r.status.value)
+                    for r in svc.list_revisions("b1")])
+PY
+```
