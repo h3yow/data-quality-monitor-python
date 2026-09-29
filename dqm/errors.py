@@ -21,9 +21,17 @@ class BatchNotFound(DQError):
     pass
 
 
+class BatchNotValidated(DQError):
+    """批次尚无任何生效结论，无法回溯（回溯的对象必须是已有旧结论的历史批次）。"""
+
+
 class BatchAlreadyExists(DQError):
     """同一 batch_id 重复登记。"""
 
 
 class ExecutionConflict(DQError):
     """批次已有生效执行，重复/并发提交被拒绝或去重。"""
+
+
+class ScopeExceeded(DQError):
+    """试算/回溯规模超过处理上界：当场拒绝并说明上界，绝不静默截断只给半截结果。"""

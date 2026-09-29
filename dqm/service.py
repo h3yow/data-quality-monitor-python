@@ -1,18 +1,20 @@
-"""服务门面：组合规则登记、批次登记、执行与查询。"""
+"""服务门面：组合规则登记、批次登记、执行、影响试算、历史回溯与查询。"""
 from __future__ import annotations
 
 from typing import Any
 
-from dqm import executor, rules
+from dqm import backfill, diffing, executor, rules, trial
 from dqm.errors import BatchNotFound, DQError
 from dqm.models import (
     Batch,
     BatchReport,
     BatchStatus,
+    BackfillSummary,
     RuleSpec,
     RuleType,
     RuleVersion,
     Severity,
+    TrialReport,
 )
 from dqm.storage import Storage
 
@@ -76,11 +78,16 @@ class DQService:
         execution = self._storage.committed_execution(batch_id)
         if execution is None or execution.status != "committed":
             return BatchReport(batch_id, batch.status, None, {}, (), ())
+        return self._report_from_execution(batch_id, execution)
+
+    @staticmethod
+    def _report_from_execution(batch_id: str, execution: Any) -> BatchReport:
         failures = tuple(f for f in execution.findings if f.severity is Severity.FAILURE)
         warnings = tuple(f for f in execution.findings if f.severity is Severity.WARNING)
+        status = (BatchStatus.FAILED if failures else BatchStatus.SUCCEEDED)
         return BatchReport(
             batch_id=batch_id,
-            status=batch.status,
+            status=status,
             execution_id=execution.execution_id,
             rule_versions=dict(execution.rule_versions),
             failures=failures,
@@ -92,3 +99,55 @@ class DQService:
         if batch is None:
             raise BatchNotFound(f"批次 {batch_id!r} 不存在")
         return batch.status
+
+    # ---- 规则升级影响试算（只读）----
+    def trial_rule(self, payload: dict[str, Any],
+                   batch_ids: list[str] | None = None) -> TrialReport:
+        """对一条待定规则做只读影响试算。
+
+        绝不修改生效规则或历史结论；候选规则非法或与现行规则打架时当场拒绝。
+        payload 与 register_rule 入参形状一致。
+        """
+        return trial.trial_rule(self._storage, _parse_spec(payload), batch_ids)
+
+    # ---- 历史批次回溯 ----
+    def backfill(self, batch_ids: list[str],
+                 interrupts: dict[str, Any] | None = None) -> BackfillSummary:
+        """把挑出的历史批次整体按当前生效规则重跑；旧结论保留可对照、可追溯。
+
+        逐批处理：单项失败只标记该项（FAILED），可单独重试，不连累其它批次。
+        """
+        return backfill.backfill_batches(self._storage, list(batch_ids),
+                                         interrupts=interrupts)
+
+    def rerun_one(self, batch_id: str) -> Any:
+        """单独重跑（重试）一个历史批次，返回 BackfillItem。"""
+        batch = self._storage.get_batch(batch_id)
+        if batch is None:
+            raise BatchNotFound(f"批次 {batch_id!r} 不存在")
+        summary = backfill.backfill_batches(self._storage, [batch_id])
+        return summary.items[0]
+
+    def conclusion_history(self, batch_id: str) -> list[BatchReport]:
+        """批次的全部历史结论（旧结论不覆盖；最旧在前，最新为当前结论）。"""
+        batch = self._storage.get_batch(batch_id)
+        if batch is None:
+            raise BatchNotFound(f"批次 {batch_id!r} 不存在")
+        reports: list[BatchReport] = []
+        for execution in self._storage.conclusion_lineage(batch_id):
+            reports.append(self._report_from_execution(batch_id, execution))
+        return reports
+
+    def compare_conclusions(self, batch_id: str) -> Any:
+        """并排对照一个批次的最新两版结论（旧 vs 新：翻盘/新增/消失/同点变化）。"""
+        batch = self._storage.get_batch(batch_id)
+        if batch is None:
+            raise BatchNotFound(f"批次 {batch_id!r} 不存在")
+        lineage = self._storage.conclusion_lineage(batch_id)
+        if len(lineage) < 2:
+            raise DQError(f"批次 {batch_id!r} 只有一版结论，没有可对照的旧结论")
+        old_execution, new_execution = lineage[-2], lineage[-1]
+        return diffing.impact_for(
+            batch_id,
+            diffing.status_from_findings(old_execution.findings),
+            old_execution.findings, new_execution.findings)

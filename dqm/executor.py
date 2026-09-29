@@ -11,7 +11,6 @@
 from __future__ import annotations
 
 import re
-import threading
 import time
 import uuid
 from collections.abc import Callable
@@ -82,44 +81,63 @@ def _final_status(findings: list[Finding]) -> BatchStatus:
             else BatchStatus.SUCCEEDED)
 
 
-def run_batch(storage: Storage, batch: Batch,
-              interrupt: Callable[[], None] | None = None) -> Execution:
-    """执行批次校验，返回生效的 Execution（可能是本调用或并发调用产生的）。"""
-    snapshot = storage.current_rules()
-    execution = Execution(
+def _wait_settled(storage: Storage, batch_id: str,
+                  conflict_id: str | None) -> Execution | None:
+    """等待冲突执行落定。
+
+    - 冲突方最终提交：返回该已提交执行；
+    - 冲突方中止（崩溃/中断）：返回 None，调用方应重新抢权重试；
+    - 冲突方其实是已提交结论（无进行中执行）：直接返回该结论。
+    """
+    deadline = time.monotonic() + 30.0
+    while True:
+        if conflict_id is not None:
+            conflict = storage.get_execution(conflict_id)
+            if conflict is not None and conflict.status == "running":
+                event = conflict.settled_event
+                if event is not None:
+                    event.wait(timeout=max(0.0, min(1.0, deadline - time.monotonic())))
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(f"等待批次 {batch_id} 执行落定超时")
+                continue
+        committed = storage.committed_execution(batch_id)
+        if committed is not None:
+            return committed
+        return None  # 冲突方已中止且尚无结论：交由调用方重试
+
+
+def _new_execution(batch_id: str, snapshot: list[RuleVersion]) -> Execution:
+    return Execution(
         execution_id=uuid.uuid4().hex,
-        batch_id=batch.batch_id,
+        batch_id=batch_id,
         attempt=1,
         rule_versions={rv.spec.rule_id: rv.version for rv in snapshot},
     )
-    acquired, effective_id = storage.try_begin_execution(execution)
-    if not acquired:
-        # 并发/重复提交：去重，等待生效执行完成并返回同一份结果
-        return _wait_committed(storage, batch.batch_id, effective_id)
-    try:
-        if interrupt is not None:
-            interrupt()  # 测试注入的中断点：模拟执行中途崩溃
-        findings = evaluate(batch.rows, snapshot)
-        storage.commit_execution(execution.execution_id, findings, _final_status(findings))
-    except BaseException:
-        storage.abort_execution(execution.execution_id)
-        raise
-    return execution
 
 
-def _wait_committed(storage: Storage, batch_id: str, execution_id: str | None,
-                    timeout: float = 30.0) -> Execution:
-    """等待生效执行提交完成；若其被 abort（中断恢复），由调用方重试。"""
-    condition = threading.Condition()
-    deadline = time.monotonic() + timeout
+def run_batch(storage: Storage, batch: Batch,
+              interrupt: Callable[[], None] | None = None) -> Execution:
+    """执行批次校验，返回生效的 Execution（可能是本调用或并发调用产生的）。
+
+    并发/重复提交时等待在进行中的执行（含回溯重跑）落定并复用同一份结论；
+    若那一跑被中止，本调用重新抢权重试，直到拿到唯一生效结论。
+    """
     while True:
-        execution = storage.committed_execution(batch_id)
-        if execution is None:
-            raise RuntimeError(f"批次 {batch_id} 的生效执行被中断，需重试")
-        if execution.status == "committed":
-            return execution
-        with condition:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError(f"等待批次 {batch_id} 执行提交超时")
-            condition.wait(timeout=min(0.01, remaining))
+        snapshot = storage.current_rules()
+        execution = _new_execution(batch.batch_id, snapshot)
+        acquired, conflict_id = storage.try_begin_execution(execution)
+        if not acquired:
+            settled = _wait_settled(storage, batch.batch_id, conflict_id)
+            if settled is not None:
+                return settled
+            continue  # 冲突的一跑被中止：重新抢权重试
+        try:
+            if interrupt is not None:
+                interrupt()  # 测试注入的中断点：模拟执行中途崩溃
+            findings = evaluate(batch.rows, snapshot)
+            storage.commit_execution(execution.execution_id, findings,
+                                     _final_status(findings))
+        except BaseException:
+            storage.abort_execution(execution.execution_id)
+            raise
+        return execution
