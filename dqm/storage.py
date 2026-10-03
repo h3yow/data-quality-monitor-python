@@ -76,11 +76,18 @@ class Storage:
         """尝试让 execution 成为批次的生效执行（compare-and-set）。
 
         返回 (是否获得执行权, 已生效的 execution_id)。
-        同一批次已有生效执行时，新执行不被接受，调用方应去重返回既有结果。
+        同一批次已有生效执行时，新执行不被接受，调用方应去重返回既有结果；
+        回溯租约占用期间同样拒绝（返回 (False, None)），调用方应等待回溯
+        尘埃落定后复用其结论或重新竞争——保证同一批次不会同时存在两个
+        执行体，尤其批次尚无旧结论时也不会出现"正常一条 + 回溯一条"。
         """
         with self._lock:
             batch = self._batches.get(execution.batch_id)
             if batch is None:
+                return False, None
+            # 回溯租约占用期间，正常校验不得另起执行：否则同一批次会出现
+            # 两条生效结论（尤其批次尚无旧结论时，_committed_by_batch 为空）
+            if execution.batch_id in self._rerun_owner:
                 return False, None
             existing = self._committed_by_batch.get(execution.batch_id)
             if existing is not None:

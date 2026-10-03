@@ -5,6 +5,7 @@ import threading
 import pytest
 
 from dqm.executor import run_batch
+from dqm.models import BatchStatus
 from dqm.service import DQService
 
 logger = logging.getLogger("test.execution")
@@ -109,7 +110,7 @@ def test_interrupted_execution_recovers_and_retries() -> None:
 
 
 def test_concurrent_validation_with_one_crash() -> None:
-    """并发提交中一个执行中断：其余提交仍收敛到唯一生效执行。"""
+    """并发提交中一个执行中断：等待方自行补跑收敛，无需调用方手动重试。"""
     service = make_service()
     service.register_batch("by", ROWS)
     batch = service.storage.get_batch("by")
@@ -136,11 +137,62 @@ def test_concurrent_validation_with_one_crash() -> None:
         t.start()
     for t in threads:
         t.join(timeout=30)
-    # 若正常线程恰好等到被 abort 的执行，则以重试补齐
-    if not results:
-        results.append(service.validate_batch("by"))
+    # 等待方必须自己收敛出结论：不抛内部错误、不需要调用方再点一次
+    assert not errors, f"等待方不应收到内部错误: {errors}"
+    assert len(results) == 1, "等待方应当场拿到结论，而非靠事后手动重试"
     final = service.validate_batch("by")
     logger.info("崩溃并发后最终结论: status=%s counts=%s", final.status.value, final.counts)
     assert final.status.value == "failed"
     assert final.counts == {"failures": 3, "warnings": 1}
-    assert not errors
+    assert final.execution_id == results[0].execution_id
+
+
+def test_waiting_duplicate_self_converges_after_owner_interrupted() -> None:
+    """抢到执行权的一次被中断：正在等待的重复调用自己补跑，收敛出唯一生效结论。"""
+    service = make_service()
+    service.register_batch("bz", ROWS)
+    batch = service.storage.get_batch("bz")
+    barrier = threading.Barrier(2)
+    calls = {"n": 0}
+    results, errors = [], []
+
+    def interrupt_once() -> None:
+        # 只有第一个进入执行体（即抢到执行权）的调用被中断；
+        # 先挂起片刻，确保另一个线程已进入等待路径，精确复现
+        # "执行方中断时等待方正在等"的撞车窗口
+        calls["n"] += 1
+        if calls["n"] == 1:
+            import time as _time
+            _time.sleep(0.15)
+            raise RuntimeError("模拟执行中断")
+
+    def worker() -> None:
+        try:
+            barrier.wait(timeout=5)
+            results.append(run_batch(service.storage, batch,
+                                     interrupt=interrupt_once))
+        except RuntimeError as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+
+    # 恰好一个线程（被中断的执行方）抛出，另一个（等待方）自行补跑成功
+    assert len(errors) == 1 and "模拟执行中断" in str(errors[0])
+    assert len(results) == 1
+    execution = results[0]
+    assert execution.status == "committed"
+    # 批次最终只有一条生效结论，状态不停在 registered/running
+    committed = service.storage.committed_execution("bz")
+    assert committed is not None and committed.execution_id == execution.execution_id
+    assert service.batch_status("bz") is BatchStatus.FAILED
+    assert len(service.storage.revisions("bz")) == 1
+    # 事后再触发校验：去重返回同一份结论
+    report = service.validate_batch("bz")
+    assert report.execution_id == execution.execution_id
+    assert report.counts == {"failures": 3, "warnings": 1}
+    logger.info("等待方自愈：中断后由等待方补跑提交 execution=%s，结论唯一",
+                execution.execution_id[:8])

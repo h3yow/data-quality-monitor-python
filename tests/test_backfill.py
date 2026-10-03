@@ -186,6 +186,253 @@ def test_bulk_backfill_failure_isolation_and_job_retry() -> None:
                 {k: v.revision_no for k, v in retried.items.items()})
 
 
+def test_backfill_job_ledger_distinguishes_rerun_and_dedup() -> None:
+    """作业账本如实区分：真重跑产出新结论（reran=True）vs 快照已最新被去重（reran=False）。"""
+    service = make_service(n_batches=3)  # 规则已收紧到 v2，历史批次仍是 v1 结论
+
+    job1 = service.backfill_batches(["b000", "b001", "b002"], max_workers=3)
+    for bid, item in job1.items.items():
+        assert item.status is BackfillItemStatus.SUCCEEDED
+        assert item.reran is True, f"{bid} 应标记为真重跑"
+        assert item.revision_no == 2
+    logger.info("首轮回溯账本（规则已收紧）: %s",
+                {k: {"reran": v.reran, "rev": v.revision_no}
+                 for k, v in job1.items.items()})
+
+    # 规则未再变化：同样的批次再回溯一次，应全部被去重，不再产生新版本
+    job2 = service.backfill_batches(["b000", "b001", "b002"], max_workers=3)
+    for bid, item in job2.items.items():
+        assert item.status is BackfillItemStatus.SUCCEEDED
+        assert item.reran is False, f"{bid} 应标记为去重跳过"
+        assert item.revision_no == 2  # 仍指向既有 v2，未追加新版本
+    assert all(len(service.storage.revisions(bid)) == 2
+               for bid in ("b000", "b001", "b002"))
+    logger.info("次轮回溯账本（规则未变）: %s —— 与首轮清晰可区分",
+                {k: {"reran": v.reran, "rev": v.revision_no}
+                 for k, v in job2.items.items()})
+
+    # 混合场景：只收紧后再回溯，含已最新批次的作业里两种标记并存
+    service.register_rule({"rule_id": "rg", "rule_type": "range", "field": "age",
+                           "params": {"min": 0, "max": 100}})
+    service.backfill_one("b000")  # b000 先单独回溯到 v3
+    job3 = service.backfill_batches(["b000", "b001"], max_workers=2)
+    assert job3.items["b000"].reran is False   # 已是 v3，去重
+    assert job3.items["b000"].revision_no == 3
+    assert job3.items["b001"].reran is True    # 从 v2 真重跑到 v3
+    assert job3.items["b001"].revision_no == 3
+    logger.info("混合账本: b000 reran=%s rev=%s, b001 reran=%s rev=%s",
+                job3.items["b000"].reran, job3.items["b000"].revision_no,
+                job3.items["b001"].reran, job3.items["b001"].revision_no)
+
+
+def test_backfill_and_validate_race_on_unvalidated_batch() -> None:
+    """未校验批次上回溯持租约、正常校验同时进来：只留一条生效结论，两边口径一致。"""
+    service = DQService()
+    service.register_rule({"rule_id": "rg", "rule_type": "range", "field": "age",
+                           "params": {"min": 0, "max": 120}})
+    service.register_batch("u1", [{"age": 150}, {"age": 300}])  # 只登记，不校验
+    batch = service.storage.get_batch("u1")
+    entered = threading.Event()
+    proceed = threading.Event()
+    results = {}
+
+    def backfiller() -> None:
+        original_evaluate = bm.evaluate
+
+        def slow_evaluate(rows, snapshot):
+            entered.set()              # 租约已持有，正在求值
+            proceed.wait(timeout=5)
+            return original_evaluate(rows, snapshot)
+
+        bm.evaluate = slow_evaluate  # type: ignore[misc]
+        try:
+            results["backfill"] = backfill_batch(service.storage, batch)
+        finally:
+            bm.evaluate = original_evaluate  # type: ignore[misc]
+
+    def validator() -> None:
+        entered.wait(timeout=5)
+        # 回溯已占租约；正常校验不得另起执行，应等待并复用回溯结论
+        results["validate"] = service.validate_batch("u1")
+
+    t1 = threading.Thread(target=backfiller)
+    t2 = threading.Thread(target=validator)
+    t1.start()
+    entered.wait(timeout=5)
+    t2.start()
+    import time as _time
+    _time.sleep(0.05)  # 确保正常校验已进入等待
+    proceed.set()
+    t1.join(timeout=10)
+    t2.join(timeout=10)
+
+    revision, reran = results["backfill"]
+    assert reran is True and revision.revision_no == 1  # 首版结论由回溯产出
+    report = results["validate"]
+    assert report.revision_no == 1
+    assert report.execution_id == revision.execution_id  # 同一份生效结论
+    assert report.rule_versions == {"rg": 1}
+    # 关键：整个批次只有一条生效结论，不存在"正常一条 + 回溯一条"
+    revisions = service.storage.revisions("u1")
+    assert len(revisions) == 1 and revisions[0].source == "backfill"
+    logger.info("未校验批次撞车收敛：唯一结论 rev1(source=backfill) "
+                "execution=%s，两边拿到同一份", revision.execution_id[:8])
+
+
+def test_backfill_validate_race_either_order_single_conclusion() -> None:
+    """未校验批次上回溯与正常校验并发（先后不定）：无论谁抢到，最终只有一条结论。"""
+    import time as _time
+
+    import dqm.executor as ex
+
+    # 把两边的求值都放慢，放大"一方持租约、另一方进来"的撞车窗口
+    original_bf_evaluate = bm.evaluate
+    original_ex_evaluate = ex.evaluate
+
+    def slow_evaluate(rows, snapshot, _orig=None):
+        _time.sleep(0.01)
+        return (_orig or original_bf_evaluate)(rows, snapshot)
+
+    for round_no in range(20):
+        service = DQService()
+        service.register_rule({"rule_id": "rg", "rule_type": "range", "field": "age",
+                               "params": {"min": 0, "max": 120}})
+        bid = f"r{round_no}"
+        service.register_batch(bid, [{"age": 150}, {"age": 300}])
+        batch = service.storage.get_batch(bid)
+        barrier = threading.Barrier(2)
+        results, errors = {}, []
+
+        def backfiller() -> None:
+            try:
+                barrier.wait(timeout=5)
+                results["backfill"] = backfill_batch(service.storage, batch)
+            except Exception as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        def validator() -> None:
+            try:
+                barrier.wait(timeout=5)
+                results["validate"] = service.validate_batch(bid)
+            except Exception as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        bm.evaluate = slow_evaluate  # type: ignore[misc]
+        ex.evaluate = lambda rows, snapshot: slow_evaluate(  # type: ignore[misc]
+            rows, snapshot, _orig=original_ex_evaluate)
+        try:
+            threads = [threading.Thread(target=backfiller),
+                       threading.Thread(target=validator)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=30)
+        finally:
+            bm.evaluate = original_bf_evaluate  # type: ignore[misc]
+            ex.evaluate = original_ex_evaluate  # type: ignore[misc]
+
+        assert not errors, f"第 {round_no} 轮出现错误: {errors}"
+        revisions = service.storage.revisions(bid)
+        assert len(revisions) == 1, (
+            f"第 {round_no} 轮出现 {len(revisions)} 条生效结论: "
+            f"{[(r.revision_no, r.source) for r in revisions]}")
+        revision, _ = results["backfill"]
+        report = results["validate"]
+        assert revision.execution_id == report.execution_id == revisions[0].execution_id
+        assert report.revision_no == 1
+    logger.info("20 轮乱序撞车（求值放慢）：每轮都只有一条生效结论，两边拿到同一份")
+
+
+def test_concurrent_backfill_waiting_side_recovers_after_interrupt() -> None:
+    """并发回溯中抢到租约的一次被中断：等待方自己补跑，收敛出唯一新结论。"""
+    service = make_service(n_batches=1)  # b000 仍是 v1 旧结论，规则已收紧
+    batch = service.storage.get_batch("b000")
+    barrier = threading.Barrier(2)
+    calls = {"n": 0}
+    results, errors = [], []
+
+    def interrupt_once() -> None:
+        # 只有第一个进入执行体（即抢到租约）的回溯被中断；
+        # 先挂起片刻，确保另一个线程已进入等待路径
+        calls["n"] += 1
+        if calls["n"] == 1:
+            import time as _time
+            _time.sleep(0.15)
+            raise RuntimeError("模拟回溯中断")
+
+    def worker() -> None:
+        try:
+            barrier.wait(timeout=5)
+            results.append(backfill_batch(service.storage, batch,
+                                          interrupt=interrupt_once))
+        except RuntimeError as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+
+    # 被中断的执行方抛出；等待方不抛内部错误，自己补跑成功
+    assert len(errors) == 1 and "模拟回溯中断" in str(errors[0])
+    assert len(results) == 1
+    revision, reran = results[0]
+    assert reran is True and revision.revision_no == 2
+    # 批次收敛到唯一新结论：v1(旧) + v2(补跑)，无半完成版本、租约已释放
+    revisions = service.storage.revisions("b000")
+    assert [r.revision_no for r in revisions] == [1, 2]
+    assert service.storage.rerun_owner("b000") is None
+    assert service.batch_status("b000") is BatchStatus.FAILED
+    assert service.get_report("b000").revision_no == 2
+    logger.info("并发回溯一方中断：等待方补跑产出 v2，版本轨迹=%s",
+                [(r.revision_no, r.source) for r in revisions])
+
+
+def test_backfill_waiter_recovers_on_unvalidated_batch_after_interrupt() -> None:
+    """未校验批次上并发回溯、抢到租约的一次被中断：等待方自己补跑，批次不留空窗。"""
+    service = DQService()
+    service.register_rule({"rule_id": "rg", "rule_type": "range", "field": "age",
+                           "params": {"min": 0, "max": 120}})
+    service.register_batch("u9", [{"age": 150}, {"age": 300}])  # 只登记，无任何结论
+    batch = service.storage.get_batch("u9")
+    barrier = threading.Barrier(2)
+    calls = {"n": 0}
+    results, errors = [], []
+
+    def interrupt_once() -> None:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            import time as _time
+            _time.sleep(0.15)  # 确保另一个线程已进入等待路径
+            raise RuntimeError("模拟回溯中断")
+
+    def worker() -> None:
+        try:
+            barrier.wait(timeout=5)
+            results.append(backfill_batch(service.storage, batch,
+                                          interrupt=interrupt_once))
+        except RuntimeError as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+
+    # 等待方不得收到 TimeoutError/内部错误，应自己补跑出首版结论
+    assert len(errors) == 1 and "模拟回溯中断" in str(errors[0])
+    assert len(results) == 1
+    revision, reran = results[0]
+    assert reran is True and revision.revision_no == 1
+    revisions = service.storage.revisions("u9")
+    assert len(revisions) == 1 and revisions[0].source == "backfill"
+    assert service.storage.rerun_owner("u9") is None
+    assert service.batch_status("u9") is BatchStatus.FAILED  # 不停在 registered
+    logger.info("未校验批次上等待方自愈：补跑产出首版结论 rev1，批次未卡住")
+
+
 def test_backfill_missing_batches_rejected() -> None:
     """回溯不存在的批次：整单明确拒绝。"""
     service = make_service(n_batches=1)

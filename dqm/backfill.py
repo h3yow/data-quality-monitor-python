@@ -7,7 +7,11 @@
   "是否已最新 + 抢租约"判定（acquire_rerun_if_stale），只放一个执行体进入；目标规则快照若已与最新结论一致，
   直接去重返回既有版本（reran=False），不重复执行、不重复计数；
 - 与正常校验互斥：回溯租约占用期间，正常 validate 会等待其完成并拿到
-  最新结论；反之亦然，两种触发方式最终结论对得上；
+  最新结论；反之亦然，两种触发方式最终结论对得上，同一批次绝不出现
+  两条生效结论；
+- 等待方自愈：等待中的重复/并发调用若遇到占用方被中断（abort），
+  不会把内部错误抛给调用方，而是重新竞争执行权自己补跑，
+  最终收敛出唯一一份生效结论，批次不会卡在未执行状态；
 - 失败隔离：批量回溯逐个批次记账，单个批次失败只把该条目标记 failed，
   不连累其它批次、不留下半完成结论，可单独/按作业重试到成功；
 - 有界处理：单次作业批次数、并发度均有上界，最终结论与逐个处理一致，
@@ -22,7 +26,13 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 
 from dqm.errors import BackfillError, BatchNotFound, WorkloadTooLarge
-from dqm.executor import MAX_ROWS_PER_BATCH, BatchTooLarge, evaluate, final_status
+from dqm.executor import (
+    MAX_ROWS_PER_BATCH,
+    BatchTooLarge,
+    evaluate,
+    final_status,
+    wait_for_effective_execution,
+)
 from dqm.models import (
     BackfillItem,
     BackfillItemStatus,
@@ -48,25 +58,6 @@ _WAIT_SPINS = 6000
 def snapshot_signature(rule_versions: dict[str, int]) -> tuple[tuple[str, int], ...]:
     """规则快照的规范化指纹（按 rule_id 排序），用于判断结论是否已是最新。"""
     return tuple(sorted(rule_versions.items()))
-
-
-def wait_for_effective_execution(storage: Storage, batch_id: str,
-                                 timeout: float = 30.0) -> Execution:
-    """等待批次当前生效执行（正常提交或回溯提交）完成，返回该 Execution。"""
-    deadline = time.monotonic() + timeout
-    while True:
-        owner = storage.rerun_owner(batch_id)
-        if owner is not None:
-            execution = storage.get_execution(owner)
-            if execution is not None and execution.status == "committed":
-                return execution
-        else:
-            execution = storage.committed_execution(batch_id)
-            if execution is not None and execution.status == "committed":
-                return execution
-        if time.monotonic() >= deadline:
-            raise TimeoutError(f"等待批次 {batch_id} 的执行提交超时")
-        time.sleep(0.005)
 
 
 def backfill_batch(
@@ -105,7 +96,9 @@ def backfill_batch(
                         batch.batch_id, dict(target))
             return latest, False
         if decision == "busy":
-            # 并发回溯或正常校验占着该批次：等其完成后回到循环顶部重新判定
+            # 并发回溯或正常校验占着该批次：等其尘埃落定后回到循环顶部重新判定。
+            # 占用方提交 -> 下一轮按"已最新"去重；占用方中断退出（返回 None）
+            # -> 下一轮由本调用自己抢到租约补跑，批次不会卡在未执行状态。
             logger.info("回溯等待 批次=%s：该批次正有执行在身，等待其完成",
                         batch.batch_id)
             wait_for_effective_execution(storage, batch.batch_id)
@@ -179,6 +172,7 @@ def _run_one_item(storage: Storage, job: BackfillJob, batch_id: str,
         revision, reran = backfill_batch(storage, batch, interrupt=interrupt)
         item.status = BackfillItemStatus.SUCCEEDED
         item.revision_no = revision.revision_no
+        item.reran = reran  # 如实记账：真重跑产出新结论 vs 快照已最新被去重
         item.error = None
         item_was = "重跑" if reran else "已最新(去重)"
         logger.info("回溯作业=%s 批次=%s 成功[%s] revision=%s",

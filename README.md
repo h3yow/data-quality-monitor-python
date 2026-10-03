@@ -69,6 +69,9 @@ REGISTERED --(获得执行权)--> RUNNING --(提交结果)--> SUCCEEDED / FAILED
 - **执行唯一生效**：`try_begin_execution` 在单锁内做 compare-and-set，
   同一批次并发/重复提交时只有一次执行获得生效权；其余调用等待并返回
   同一份已提交结果——不重复执行、不重复计数。
+- **等待方自愈**：若抢到执行权（或回溯租约）的一方中途被 abort，
+  正在等待的调用不会收到内部错误，而是重新竞争执行权、自己补跑，
+  最终收敛出唯一一份生效结论；批次不会卡在未执行状态。
 - **原子提交**：结果与批次状态推进在同一临界区完成，查询要么看到完整结论，
   要么看到未执行状态，绝不出现半完成结果。
 - **规则快照**：执行开始时抓取当前生效规则版本快照（`rule_versions`），
@@ -124,8 +127,19 @@ for imp in result.impacts:
   "是否已最新 + 抢租约"判定（`acquire_rerun_if_stale`），同一批次被重复或
   并发回溯时只有一次真正执行，输的一方等待并复用同一结果，计数绝不翻倍。
   目标规则快照若已与最新结论一致，直接去重返回（`reran=false`），不产生新版本。
-- **与正常校验互斥且结论对齐**：回溯进行中正常触发校验会等待其完成并拿到
-  回溯后的最新结论；反过来正常校验占用时回溯也会等待。两者撞车最终结论一致。
+- **账本如实区分"真重跑"与"去重"**：作业账本每条批次记录的 `reran` 字段
+  就是本次对该批次的真实处置——`reran=true` 表示真正重跑并追加了新结论版本
+  （`revision_no` 指向新版本）；`reran=false` 表示目标快照已与最新结论一致、
+  被去重跳过（`revision_no` 指向既有版本，未追加新版本）。事后对着账本即可
+  分清每条批次属于哪种情况，两种情形不会混在一起。
+- **与正常校验互斥且结论对齐**：回溯租约占用期间，正常校验在存储层
+  （`try_begin_execution`）即被挡下并等待，复用回溯产出的结论；反过来正常
+  校验占用时回溯也会等待。即使批次**从未校验过**（没有任何旧结论），两边
+  同时进来也只会有一个执行体真正生效——该批次最终只有一条生效结论，
+  两边调用拿到的是同一份（同一个 `execution_id` / `revision_no`）。
+- **等待方自愈**：等待中的重复/并发调用若遇到占用方被中断（abort），
+  不会把内部错误抛给调用方，而是重新竞争执行权自己补跑，最终收敛出
+  唯一一份生效结论；批次不会卡在 `registered`/`running` 状态。
 - **失败隔离 + 可单独重试**：批量回溯逐批次记账（`pending/running/
   succeeded/failed`）。某批次失败或被中断，只把该条目标记 `failed` 并记录
   错误、释放租约、恢复旧结论状态，不连累同批其它批次、不留半完成结论；
@@ -180,24 +194,46 @@ GET  /batches/{id}/revisions         列出全部历史结论版本（含 source
 
 ```bash
 uv sync
-uv run pytest -q        # 36 个测试，日志打印输入数据与判定依据
+uv run pytest -q        # 42 个测试，日志打印输入数据与判定依据
 uv run uvicorn main:app # 启动 HTTP 服务（/docs 可交互试调）
 ```
+
+### 亲手复验回溯的三类关键场景
+
+```bash
+# ① 账本区分"真重跑"与"去重"（首轮 reran=true、次轮 reran=false、混合并存）
+uv run pytest -v tests/test_backfill.py::test_backfill_job_ledger_distinguishes_rerun_and_dedup
+
+# ② 未校验批次上回溯与正常校验撞车：只有一条生效结论，两边拿到同一份
+uv run pytest -v tests/test_backfill.py::test_backfill_and_validate_race_on_unvalidated_batch
+uv run pytest -v tests/test_backfill.py::test_backfill_validate_race_either_order_single_conclusion
+
+# ③ 抢到执行权的一次被中断：等待方自己补跑收敛，不抛内部错误、批次不卡住
+uv run pytest -v tests/test_execution.py::test_waiting_duplicate_self_converges_after_owner_interrupted
+uv run pytest -v tests/test_backfill.py::test_concurrent_backfill_waiting_side_recovers_after_interrupt
+uv run pytest -v tests/test_backfill.py::test_backfill_waiter_recovers_on_unvalidated_batch_after_interrupt
+```
+
+日志（`log_cli` 已开启）会打印每轮的账本标记（`reran`/`revision_no`）、
+撞车收敛后的唯一 `execution_id`，以及等待方补跑产出的结论版本。
 
 测试覆盖：
 
 - `tests/test_rules.py`：三类拒绝原因可区分；被拒绝规则不留残渣。
 - `tests/test_execution.py`：重复提交去重；8 线程并发仅一次有效执行；
-  中断恢复；并发中一次崩溃仍收敛到唯一生效执行。
+  中断恢复；并发中一次崩溃时等待方自行补跑、收敛到唯一生效执行（不抛内部错误）。
 - `tests/test_versioning.py`：规则变更后历史批次结论不变且可按快照复现；
   新批次适用新规则；重复查询稳定一致。
 - `tests/test_trial.py`：翻盘/受影响批次、每批新增消失命中与级别分布；
   只读（规则版本、历史结论、版本数均不变）；重复试算按值相等且顺序确定；
   纳入未校验批次；非法/冲突/超量当场拒绝；试算仅持有只读视图（无写方法可达）。
 - `tests/test_backfill.py`：回溯追加修订版本且旧结论保留可复现；新旧对照；
-  快照已最新时去重不重跑；6 线程并发仅一次真正重跑（连跑稳定不闪烁）；
+  快照已最新时去重不重跑；作业账本 `reran` 如实区分真重跑与去重（含混合场景）；
+  6 线程并发仅一次真正重跑（连跑稳定不闪烁）；
   中断后恢复旧结论、无半完成结果、可单独重试；批量失败隔离与作业重试；
-  回溯与正常校验撞车结论一致；25 批次乱序 + 8 并发与逐个串行结论完全一致；
+  回溯与正常校验撞车结论一致（含从未校验批次：只有一条生效结论）；
+  并发回溯中一方中断时等待方自行补跑收敛；
+  25 批次乱序 + 8 并发与逐个串行结论完全一致；
   批次数/单批行数超上界被拒绝。
 - `tests/test_api.py`：试算只读/可重复端点、非法候选 422、回溯全流程与
   作业重试端点端到端可用。
