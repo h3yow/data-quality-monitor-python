@@ -68,7 +68,9 @@ REGISTERED --(获得执行权)--> RUNNING --(提交结果)--> SUCCEEDED / FAILED
 - **批次登记幂等**：同一 `batch_id` 重复登记返回 `created=false`，不覆盖原数据。
 - **执行唯一生效**：`try_begin_execution` 在单锁内做 compare-and-set，
   同一批次并发/重复提交时只有一次执行获得生效权；其余调用等待并返回
-  同一份已提交结果——不重复执行、不重复计数。
+  同一份已提交结果——不重复执行、不重复计数。若抢到执行权的一方中途
+  abort，等待方会重新争抢执行权自行补跑，收敛出唯一结论，
+  不向调用方暴露"需重试"内部错误。
 - **原子提交**：结果与批次状态推进在同一临界区完成，查询要么看到完整结论，
   要么看到未执行状态，绝不出现半完成结果。
 - **规则快照**：执行开始时抓取当前生效规则版本快照（`rule_versions`），
@@ -124,8 +126,21 @@ for imp in result.impacts:
   "是否已最新 + 抢租约"判定（`acquire_rerun_if_stale`），同一批次被重复或
   并发回溯时只有一次真正执行，输的一方等待并复用同一结果，计数绝不翻倍。
   目标规则快照若已与最新结论一致，直接去重返回（`reran=false`），不产生新版本。
-- **与正常校验互斥且结论对齐**：回溯进行中正常触发校验会等待其完成并拿到
-  回溯后的最新结论；反过来正常校验占用时回溯也会等待。两者撞车最终结论一致。
+- **账本如实区分「真重跑」与「去重」**：作业账本里每个批次条目带 `reran`
+  标记——`reran=true` 表示本次真正重跑并追加了一个新结论版本
+  （`revision_no` 指向新版本）；`reran=false` 表示目标快照已与最新结论一致、
+  本次被去重跳过（`revision_no` 指向既有版本，版本数不变）。两种情况在账本上
+  一眼可分，不会混成同一种记录。
+- **与正常校验互斥且结论对齐**：回溯租约占用期间，正常校验抢执行权会被拒
+  （`try_begin_execution` 同样检查回溯租约），转为等待并复用回溯产出的结论；
+  反过来正常校验在执行时回溯也会等待。**即使批次从未校验过**（只有登记数据），
+  两边同时到达也只留一条生效结论：谁先占到执行权就由谁产出首版结论
+  （`source` 记为 `backfill` 或 `normal`），另一边拿到同一份结果，
+  绝不出现"正常校验一条、回溯一条"两条生效结论。
+- **等待方自行收敛**：等待中的重复/并发调用如果遇到占用方中途 abort
+  （中断/崩溃），不会被抛内部错误、批次也不会卡在未执行状态——等待方会
+  重新争抢执行权自行补跑，最终收敛出唯一一份正确结论；中断方本身仍可
+  安全重试。单个批次失败只影响自己，可单独重试到成功。
 - **失败隔离 + 可单独重试**：批量回溯逐批次记账（`pending/running/
   succeeded/failed`）。某批次失败或被中断，只把该条目标记 `failed` 并记录
   错误、释放租约、恢复旧结论状态，不连累同批其它批次、不留半完成结论；
@@ -180,7 +195,7 @@ GET  /batches/{id}/revisions         列出全部历史结论版本（含 source
 
 ```bash
 uv sync
-uv run pytest -q        # 36 个测试，日志打印输入数据与判定依据
+uv run pytest -q        # 42 个测试，日志打印输入数据与判定依据
 uv run uvicorn main:app # 启动 HTTP 服务（/docs 可交互试调）
 ```
 
@@ -188,17 +203,20 @@ uv run uvicorn main:app # 启动 HTTP 服务（/docs 可交互试调）
 
 - `tests/test_rules.py`：三类拒绝原因可区分；被拒绝规则不留残渣。
 - `tests/test_execution.py`：重复提交去重；8 线程并发仅一次有效执行；
-  中断恢复；并发中一次崩溃仍收敛到唯一生效执行。
+  中断恢复；并发中一次崩溃仍收敛到唯一生效执行；等待中的重复提交遇到
+  占用方崩溃时自行补跑收敛（不抛内部错误、批次不卡住）。
 - `tests/test_versioning.py`：规则变更后历史批次结论不变且可按快照复现；
   新批次适用新规则；重复查询稳定一致。
 - `tests/test_trial.py`：翻盘/受影响批次、每批新增消失命中与级别分布；
   只读（规则版本、历史结论、版本数均不变）；重复试算按值相等且顺序确定；
   纳入未校验批次；非法/冲突/超量当场拒绝；试算仅持有只读视图（无写方法可达）。
 - `tests/test_backfill.py`：回溯追加修订版本且旧结论保留可复现；新旧对照；
-  快照已最新时去重不重跑；6 线程并发仅一次真正重跑（连跑稳定不闪烁）；
+  快照已最新时去重不重跑；作业账本如实区分真重跑（`reran=true`）与去重
+  （`reran=false`）；6 线程并发仅一次真正重跑（连跑稳定不闪烁）；
   中断后恢复旧结论、无半完成结果、可单独重试；批量失败隔离与作业重试；
-  回溯与正常校验撞车结论一致；25 批次乱序 + 8 并发与逐个串行结论完全一致；
-  批次数/单批行数超上界被拒绝。
+  回溯与正常校验撞车结论一致；**未校验批次**上回溯与正常校验双向撞车
+  只留一条生效结论；等待方遇占用方（正常校验/回溯）崩溃自行收敛；
+  25 批次乱序 + 8 并发与逐个串行结论完全一致；批次数/单批行数超上界被拒绝。
 - `tests/test_api.py`：试算只读/可重复端点、非法候选 422、回溯全流程与
   作业重试端点端到端可用。
 
@@ -248,5 +266,45 @@ svc.register_rule({"rule_id": "rg", "rule_type": "range", "field": "age",
 print("回溯对照:", svc.backfill_one("b1"))
 print("历史版本:", [(r.revision_no, r.source, r.status.value)
                     for r in svc.list_revisions("b1")])
+PY
+```
+
+### 亲自验证回溯记账与并发口径
+
+三个关键场景都有稳定的自动化用例，单跑即可（日志会打印每个场景的依据与结论）：
+
+```bash
+# ① 账本区分真重跑 / 去重
+uv run pytest tests/test_backfill.py::test_backfill_job_ledger_distinguishes_rerun_and_dedup -v
+
+# ② 未校验批次上回溯与正常校验双向撞车，只留一条生效结论
+uv run pytest tests/test_backfill.py::test_race_on_unvalidated_batch_backfill_first \
+              tests/test_backfill.py::test_race_on_unvalidated_batch_validate_first -v
+
+# ③ 等待方遇占用方中断后自行收敛（正常校验 / 回溯两个方向）
+uv run pytest tests/test_execution.py::test_waiting_duplicate_converges_after_owner_crash \
+              tests/test_backfill.py::test_backfill_waiter_converges_after_validate_crash \
+              tests/test_backfill.py::test_validate_waiter_converges_after_backfill_crash -v
+```
+
+场景① 也可以用一段 Python 直接看账本：
+
+```bash
+uv run python - <<'PY'
+from dqm.service import DQService
+svc = DQService()
+svc.register_rule({"rule_id": "rg", "rule_type": "range", "field": "age",
+                   "params": {"min": 0, "max": 200}})
+for bid in ("b1", "b2"):
+    svc.register_batch(bid, [{"age": 150}, {"age": 300}])
+    svc.validate_batch(bid)
+svc.register_rule({"rule_id": "rg", "rule_type": "range", "field": "age",
+                   "params": {"min": 0, "max": 120}})   # 收紧规则
+svc.backfill_one("b1")                                  # b1 先回溯到 v2
+job = svc.backfill_batches(["b1", "b2"])                # b1 已最新、b2 落后一版
+for bid, item in job.items.items():
+    print(bid, "reran =", item.reran, " revision =", item.revision_no)
+# b1 reran = False  revision = 2   <- 去重：版本数不变
+# b2 reran = True   revision = 2   <- 真重跑：本次追加的新版本
 PY
 ```

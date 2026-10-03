@@ -7,7 +7,7 @@ import pytest
 from dqm import backfill as bm
 from dqm.backfill import backfill_batch, backfill_batches
 from dqm.errors import BackfillError
-from dqm.executor import evaluate
+from dqm.executor import evaluate, run_batch
 from dqm.models import BackfillItemStatus, BatchStatus, Severity
 from dqm.service import DQService
 
@@ -89,6 +89,33 @@ def test_backfill_deduplicated_when_snapshot_current() -> None:
     assert reran is False and rev.revision_no == 2
     assert len(service.storage.revisions("b000")) == 2
     logger.info("快照已最新时回溯被去重（reran=False），结论版本仍为 2")
+
+
+def test_backfill_job_ledger_distinguishes_rerun_and_dedup() -> None:
+    """回溯作业账本：真重跑与去重条目如实区分，不混成一种记录。"""
+    service = make_service(n_batches=2)  # b000/b001 均按 v1 定论，规则已收紧到 v2
+    service.backfill_one("b000")  # b000 先单独回溯到 v2（真重跑）
+
+    # 同一作业内：b000 快照已最新（应记去重），b001 落后一版（应记真重跑）
+    job = service.backfill_batches(["b000", "b001"], max_workers=2)
+    dedup_item, rerun_item = job.items["b000"], job.items["b001"]
+    logger.info("混合作业账本: b000 reran=%s rev=%s, b001 reran=%s rev=%s",
+                dedup_item.reran, dedup_item.revision_no,
+                rerun_item.reran, rerun_item.revision_no)
+    assert dedup_item.status is BackfillItemStatus.SUCCEEDED
+    assert rerun_item.status is BackfillItemStatus.SUCCEEDED
+    assert dedup_item.reran is False and dedup_item.revision_no == 2
+    assert rerun_item.reran is True and rerun_item.revision_no == 2
+    # 去重条目没有追加版本；真重跑条目恰好追加一版
+    assert [r.revision_no for r in service.storage.revisions("b000")] == [1, 2]
+    assert [r.revision_no for r in service.storage.revisions("b001")] == [1, 2]
+
+    # 规则未再变化时整体回溯：作业里每条记录都应是去重，且与真重跑记录可区分
+    job2 = service.backfill_batches(["b000", "b001"], max_workers=2)
+    assert all(item.reran is False for item in job2.items.values())
+    assert all(item.revision_no == 2 for item in job2.items.values())
+    assert all(len(service.storage.revisions(bid)) == 2 for bid in ("b000", "b001"))
+    logger.info("规则未变的整体回溯：全部条目 reran=False（纯去重），版本数不变")
 
 
 def test_concurrent_backfill_single_effective() -> None:
@@ -273,6 +300,197 @@ def test_backfill_collides_with_normal_validation() -> None:
     assert results["validate"].rule_versions == {"rg": 2}
     assert [r.revision_no for r in service.storage.revisions("b000")] == [1, 2]
     logger.info("回溯与正常校验撞车后结论一致：均为 v2")
+
+
+def test_race_on_unvalidated_batch_backfill_first() -> None:
+    """未校验批次上回溯先占租约、正常校验同时到达：只留一条生效结论。"""
+    service = DQService()
+    service.register_rule({"rule_id": "rg", "rule_type": "range", "field": "age",
+                           "params": {"min": 0, "max": 120}})
+    service.register_batch("u1", [{"age": 150}, {"age": 300}])  # 只登记，未校验
+    batch = service.storage.get_batch("u1")
+    entered = threading.Event()
+    proceed = threading.Event()
+    results, errors = {}, []
+
+    def backfiller() -> None:
+        original_evaluate = bm.evaluate
+
+        def slow_evaluate(rows, snapshot):
+            entered.set()                    # 回溯已占租约、正在求值
+            proceed.wait(timeout=5)
+            return original_evaluate(rows, snapshot)
+
+        bm.evaluate = slow_evaluate  # type: ignore[misc]
+        try:
+            results["backfill"] = backfill_batch(service.storage, batch)
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+        finally:
+            bm.evaluate = original_evaluate  # type: ignore[misc]
+
+    def validator() -> None:
+        entered.wait(timeout=5)
+        try:
+            results["validate"] = service.validate_batch("u1")
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    t1 = threading.Thread(target=backfiller)
+    t1.start()
+    entered.wait(timeout=5)
+    t2 = threading.Thread(target=validator)
+    t2.start()
+    import time as _time
+    _time.sleep(0.05)  # 确保正常校验已进来并进入等待
+    proceed.set()
+    t1.join(timeout=10)
+    t2.join(timeout=10)
+
+    assert not errors, errors
+    revision, reran = results["backfill"]
+    report = results["validate"]
+    logger.info("未校验批次撞车（回溯先）: backfill rev=%s reran=%s, "
+                "validate rev=%s execution=%s",
+                revision.revision_no, reran, report.revision_no, report.execution_id)
+    assert reran is True and revision.revision_no == 1
+    # 正常校验拿到的是回溯产出的同一份结论，而不是自己再跑一份
+    assert report.revision_no == 1 and report.execution_id == revision.execution_id
+    revisions = service.storage.revisions("u1")
+    assert len(revisions) == 1 and revisions[0].source == "backfill"
+    assert service.storage.committed_execution("u1").execution_id == revision.execution_id
+
+
+def test_race_on_unvalidated_batch_validate_first() -> None:
+    """未校验批次上正常校验先占执行权、回溯同时到达：回溯去重，仍只有一条结论。"""
+    import dqm.executor as ex
+
+    service = DQService()
+    service.register_rule({"rule_id": "rg", "rule_type": "range", "field": "age",
+                           "params": {"min": 0, "max": 120}})
+    service.register_batch("u2", [{"age": 150}, {"age": 300}])  # 只登记，未校验
+    batch = service.storage.get_batch("u2")
+    entered = threading.Event()
+    proceed = threading.Event()
+    results, errors = {}, []
+
+    original_evaluate = ex.evaluate
+
+    def slow_evaluate(rows, snapshot):
+        entered.set()                        # 正常校验已占执行权、正在求值
+        proceed.wait(timeout=5)
+        return original_evaluate(rows, snapshot)
+
+    def validator() -> None:
+        ex.evaluate = slow_evaluate  # type: ignore[misc]
+        try:
+            results["validate"] = service.validate_batch("u2")
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+        finally:
+            ex.evaluate = original_evaluate  # type: ignore[misc]
+
+    def backfiller() -> None:
+        entered.wait(timeout=5)
+        try:
+            results["backfill"] = backfill_batch(service.storage, batch)
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    t1 = threading.Thread(target=validator)
+    t1.start()
+    entered.wait(timeout=5)
+    t2 = threading.Thread(target=backfiller)
+    t2.start()
+    import time as _time
+    _time.sleep(0.05)  # 确保回溯已进来并进入等待
+    proceed.set()
+    t1.join(timeout=10)
+    t2.join(timeout=10)
+
+    assert not errors, errors
+    report = results["validate"]
+    revision, reran = results["backfill"]
+    logger.info("未校验批次撞车（校验先）: validate rev=%s, backfill rev=%s reran=%s",
+                report.revision_no, revision.revision_no, reran)
+    # 快照已与正常校验结论一致：回溯被去重，不产生第二条生效结论
+    assert reran is False and revision.revision_no == 1
+    assert report.revision_no == 1
+    revisions = service.storage.revisions("u2")
+    assert len(revisions) == 1 and revisions[0].source == "normal"
+
+
+def test_backfill_waiter_converges_after_validate_crash() -> None:
+    """回溯等待正常校验时对方崩溃：回溯自行补跑收敛，批次不留未执行状态。"""
+    import time as _time
+
+    service = DQService()
+    service.register_rule({"rule_id": "rg", "rule_type": "range", "field": "age",
+                           "params": {"min": 0, "max": 120}})
+    service.register_batch("w1", [{"age": 150}, {"age": 300}])  # 只登记，未校验
+    batch = service.storage.get_batch("w1")
+    acquired = threading.Event()
+
+    def crash() -> None:
+        acquired.set()           # 正常校验已占执行权
+        _time.sleep(0.3)         # 留出窗口让回溯进入等待状态
+        raise RuntimeError("模拟正常校验中断")
+
+    def crasher() -> None:
+        try:
+            run_batch(service.storage, batch, interrupt=crash)
+        except RuntimeError:
+            pass  # 中断方本身抛错是预期行为
+
+    t = threading.Thread(target=crasher)
+    t.start()
+    acquired.wait(timeout=5)
+    revision, reran = backfill_batch(service.storage, batch)  # 等待方：应自行收敛
+    t.join(timeout=10)
+
+    logger.info("正常校验崩溃后回溯自行收敛: rev=%s reran=%s source=%s",
+                revision.revision_no, reran, revision.source)
+    assert reran is True and revision.revision_no == 1
+    revisions = service.storage.revisions("w1")
+    assert len(revisions) == 1 and revisions[0].source == "backfill"
+    assert service.batch_status("w1") is BatchStatus.FAILED
+    assert service.get_report("w1").revision_no == 1
+
+
+def test_validate_waiter_converges_after_backfill_crash() -> None:
+    """正常校验等待回溯时对方崩溃：校验自行补跑收敛，不向用户抛内部错误。"""
+    import time as _time
+
+    service = DQService()
+    service.register_rule({"rule_id": "rg", "rule_type": "range", "field": "age",
+                           "params": {"min": 0, "max": 120}})
+    service.register_batch("w2", [{"age": 150}, {"age": 300}])  # 只登记，未校验
+    batch = service.storage.get_batch("w2")
+    acquired = threading.Event()
+
+    def crash() -> None:
+        acquired.set()           # 回溯已占租约
+        _time.sleep(0.3)         # 留出窗口让正常校验进入等待状态
+        raise RuntimeError("模拟回溯中断")
+
+    def crasher() -> None:
+        try:
+            backfill_batch(service.storage, batch, interrupt=crash)
+        except RuntimeError:
+            pass  # 中断方本身抛错是预期行为
+
+    t = threading.Thread(target=crasher)
+    t.start()
+    acquired.wait(timeout=5)
+    report = service.validate_batch("w2")  # 等待方：应自行收敛而非报错
+    t.join(timeout=10)
+
+    logger.info("回溯崩溃后正常校验自行收敛: rev=%s status=%s counts=%s",
+                report.revision_no, report.status.value, report.counts)
+    assert report.revision_no == 1 and report.status is BatchStatus.FAILED
+    revisions = service.storage.revisions("w2")
+    assert len(revisions) == 1 and revisions[0].source == "normal"
+    assert service.storage.rerun_owner("w2") is None
 
 
 def test_large_backfill_matches_one_by_one() -> None:

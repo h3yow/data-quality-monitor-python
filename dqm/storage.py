@@ -77,11 +77,16 @@ class Storage:
 
         返回 (是否获得执行权, 已生效的 execution_id)。
         同一批次已有生效执行时，新执行不被接受，调用方应去重返回既有结果。
+        批次被回溯租约占用时同样拒绝（租约提交前 _committed_by_batch 仍指向
+        旧结论或为空，若不拦截，正常校验会与回溯并发执行、产生两条生效结论）。
         """
         with self._lock:
             batch = self._batches.get(execution.batch_id)
             if batch is None:
                 return False, None
+            rerun = self._rerun_owner.get(execution.batch_id)
+            if rerun is not None:
+                return False, rerun
             existing = self._committed_by_batch.get(execution.batch_id)
             if existing is not None:
                 return False, existing

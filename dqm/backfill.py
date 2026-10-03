@@ -51,8 +51,13 @@ def snapshot_signature(rule_versions: dict[str, int]) -> tuple[tuple[str, int], 
 
 
 def wait_for_effective_execution(storage: Storage, batch_id: str,
-                                 timeout: float = 30.0) -> Execution:
-    """等待批次当前生效执行（正常提交或回溯提交）完成，返回该 Execution。"""
+                                 timeout: float = 30.0) -> Execution | None:
+    """等待批次当前生效执行（正常提交或回溯提交）完成。
+
+    返回已提交的 Execution；若占用方中途 abort 且批次尚无任何生效结论，
+    返回 None——调用方应回到自己的定心循环重新判定（自行补跑或继续去重），
+    不把"占用方被中断"这一内部细节抛给最终调用方。
+    """
     deadline = time.monotonic() + timeout
     while True:
         owner = storage.rerun_owner(batch_id)
@@ -62,7 +67,10 @@ def wait_for_effective_execution(storage: Storage, batch_id: str,
                 return execution
         else:
             execution = storage.committed_execution(batch_id)
-            if execution is not None and execution.status == "committed":
+            if execution is None:
+                # 占用方已中断退出且没有留下生效结论：交由调用方重新判定
+                return None
+            if execution.status == "committed":
                 return execution
         if time.monotonic() >= deadline:
             raise TimeoutError(f"等待批次 {batch_id} 的执行提交超时")
@@ -179,6 +187,7 @@ def _run_one_item(storage: Storage, job: BackfillJob, batch_id: str,
         revision, reran = backfill_batch(storage, batch, interrupt=interrupt)
         item.status = BackfillItemStatus.SUCCEEDED
         item.revision_no = revision.revision_no
+        item.reran = reran  # 如实记账：真重跑产新版 / 快照已最新被去重
         item.error = None
         item_was = "重跑" if reran else "已最新(去重)"
         logger.info("回溯作业=%s 批次=%s 成功[%s] revision=%s",

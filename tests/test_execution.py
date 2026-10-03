@@ -144,3 +144,53 @@ def test_concurrent_validation_with_one_crash() -> None:
     assert final.status.value == "failed"
     assert final.counts == {"failures": 3, "warnings": 1}
     assert not errors
+
+
+def test_waiting_duplicate_converges_after_owner_crash() -> None:
+    """等待中的重复提交遇到占用方崩溃：自行补跑收敛，不抛内部错误、批次不卡住。"""
+    import time as _time
+
+    service = make_service()
+    service.register_batch("bz", ROWS)
+    batch = service.storage.get_batch("bz")
+    acquired = threading.Event()
+    results, errors = [], []
+
+    def crash() -> None:
+        acquired.set()          # 崩溃方已占执行权
+        _time.sleep(0.3)        # 留出窗口让等待方进入等待状态
+        raise RuntimeError("模拟执行中断")
+
+    def crasher() -> None:
+        try:
+            run_batch(service.storage, batch, interrupt=crash)
+        except RuntimeError:
+            pass  # 中断方本身抛错是预期行为
+
+    def waiter() -> None:
+        acquired.wait(timeout=5)
+        try:
+            # 崩溃方占着执行权时进来：只能进入等待分支
+            results.append(service.validate_batch("bz"))
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    threads = [threading.Thread(target=crasher), threading.Thread(target=waiter)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+
+    # 等待方不抛"需重试"内部错误，而是自己补跑收敛出唯一结论
+    assert not errors, f"等待方不应收到内部错误: {errors}"
+    assert len(results) == 1
+    report = results[0]
+    logger.info("占用方崩溃后等待方自行收敛: status=%s counts=%s execution=%s",
+                report.status.value, report.counts, report.execution_id)
+    assert report.status.value == "failed"
+    assert report.counts == {"failures": 3, "warnings": 1}
+    # 批次不停留在未执行状态；生效执行只有一份，结论版本只有一版
+    assert service.batch_status("bz").value == "failed"
+    committed = service.storage.committed_execution("bz")
+    assert committed is not None and committed.execution_id == report.execution_id
+    assert len(service.storage.revisions("bz")) == 1

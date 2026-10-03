@@ -5,14 +5,14 @@
   之后规则变更不影响本批次结论（可复现）；
 - 同一批次并发/重复提交时，只有抢到执行权的一次真正执行，
   其余调用等待并返回同一份已生效结果（不重复执行、不重复计数）；
+  若抢到执行权的一方中途 abort，等待方会重新争抢执行权自行补跑，
+  最终收敛出唯一一份结论，不向调用方暴露内部中断；
 - 执行体中任何异常（含测试注入的中断）都会 abort：执行权释放、
   批次状态恢复 REGISTERED，不留下半完成结果，可安全重试。
 """
 from __future__ import annotations
 
 import re
-import threading
-import time
 import uuid
 from collections.abc import Callable
 
@@ -22,6 +22,9 @@ from dqm.storage import Storage
 # 单批次处理上界：行数过大时明确拒绝（由上层转译为 WorkloadTooLarge），
 # 避免单个超大批次把求值变成无界操作；该上界内结论与逐行处理完全一致。
 MAX_ROWS_PER_BATCH = 100_000
+
+# 等待占用方（并发校验/回溯）完成的最大重判轮数，防止异常竞态下无限循环
+_WAIT_SPINS = 6000
 
 
 class BatchTooLarge(Exception):
@@ -99,54 +102,45 @@ final_status = _final_status
 
 def run_batch(storage: Storage, batch: Batch,
               interrupt: Callable[[], None] | None = None) -> Execution:
-    """执行批次校验，返回生效的 Execution（可能是本调用或并发调用产生的）。"""
-    snapshot = storage.current_rules()
-    execution = Execution(
-        execution_id=uuid.uuid4().hex,
-        batch_id=batch.batch_id,
-        attempt=1,
-        rule_versions={rv.spec.rule_id: rv.version for rv in snapshot},
-    )
-    acquired, effective_id = storage.try_begin_execution(execution)
-    if not acquired:
-        # 并发/重复提交：去重，等待生效执行完成并返回同一份结果。
-        # 若正好有历史回溯在跑，等它完成，返回回溯产生的最新结论——
-        # 正常触发与回溯撞车时，两边拿到的结论对得上。
-        if storage.rerun_owner(batch.batch_id) is not None:
-            from dqm.backfill import wait_for_effective_execution
+    """执行批次校验，返回生效的 Execution（可能是本调用或并发调用产生的）。
 
-            return wait_for_effective_execution(storage, batch.batch_id)
-        return _wait_committed(storage, batch.batch_id, effective_id)
-    try:
-        if interrupt is not None:
-            interrupt()  # 测试注入的中断点：模拟执行中途崩溃
-        findings = evaluate(batch.rows, snapshot)
-        storage.commit_execution(execution.execution_id, findings, _final_status(findings))
-    except BatchTooLarge:
-        storage.abort_execution(execution.execution_id)
-        from dqm.errors import WorkloadTooLarge
-        raise WorkloadTooLarge(
-            f"批次 {batch.batch_id!r} 行数 {len(batch.rows)} 超过单批上界 "
-            f"{MAX_ROWS_PER_BATCH}，拒绝执行（不留半完成结果）")
-    except BaseException:
-        storage.abort_execution(execution.execution_id)
-        raise
-    return execution
+    定心循环：未抢到执行权时等待当前占用方提交；占用方若中途 abort
+    （中断/崩溃）且没留下生效结论，等待方回到循环顶部重新争抢执行权
+    自行补跑——收敛出唯一一份结论，不把内部中断抛给调用方。
+    """
+    from dqm.backfill import wait_for_effective_execution  # 延迟导入避免循环依赖
 
+    for _ in range(_WAIT_SPINS):
+        snapshot = storage.current_rules()
+        execution = Execution(
+            execution_id=uuid.uuid4().hex,
+            batch_id=batch.batch_id,
+            attempt=1,
+            rule_versions={rv.spec.rule_id: rv.version for rv in snapshot},
+        )
+        acquired, _effective_id = storage.try_begin_execution(execution)
+        if not acquired:
+            # 并发/重复提交（含与回溯撞车）：去重，等待生效执行完成并返回
+            # 同一份结果。占用方被中断且未留下结论时返回 None，重新判定。
+            effective = wait_for_effective_execution(storage, batch.batch_id)
+            if effective is not None:
+                return effective
+            continue
+        try:
+            if interrupt is not None:
+                interrupt()  # 测试注入的中断点：模拟执行中途崩溃
+            findings = evaluate(batch.rows, snapshot)
+            storage.commit_execution(execution.execution_id, findings,
+                                     _final_status(findings))
+        except BatchTooLarge:
+            storage.abort_execution(execution.execution_id)
+            from dqm.errors import WorkloadTooLarge
+            raise WorkloadTooLarge(
+                f"批次 {batch.batch_id!r} 行数 {len(batch.rows)} 超过单批上界 "
+                f"{MAX_ROWS_PER_BATCH}，拒绝执行（不留半完成结果）")
+        except BaseException:
+            storage.abort_execution(execution.execution_id)
+            raise
+        return execution
 
-def _wait_committed(storage: Storage, batch_id: str, execution_id: str | None,
-                    timeout: float = 30.0) -> Execution:
-    """等待生效执行提交完成；若其被 abort（中断恢复），由调用方重试。"""
-    condition = threading.Condition()
-    deadline = time.monotonic() + timeout
-    while True:
-        execution = storage.committed_execution(batch_id)
-        if execution is None:
-            raise RuntimeError(f"批次 {batch_id} 的生效执行被中断，需重试")
-        if execution.status == "committed":
-            return execution
-        with condition:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError(f"等待批次 {batch_id} 执行提交超时")
-            condition.wait(timeout=min(0.01, remaining))
+    raise TimeoutError(f"批次 {batch.batch_id} 等待占用方释放超时")
